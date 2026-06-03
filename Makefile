@@ -92,6 +92,7 @@ OBJS_EXE = \
 TESTS = \
 	$(BUILDDIR)/test/ardop/test_ARDOPCommon \
 	$(BUILDDIR)/test/ardop/test_HostInterface \
+	$(BUILDDIR)/test/ardop/test_KISS \
 	$(BUILDDIR)/test/ardop/test_Locator \
 	$(BUILDDIR)/test/ardop/test_log \
 	$(BUILDDIR)/test/ardop/test_Packed6 \

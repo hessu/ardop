@@ -55,9 +55,6 @@
 #define TFESC 0xDD  // Transposed Frame Escape
 
 #define KISS_MAX_CLIENTS 16
-// Generous buffer.  Larger than any single FEC frame payload, with margin for
-// KISS escaping.
-#define KISS_BUFSIZE 2048
 
 // Configuration (set by KISSConfig() from the --kiss command line option)
 int KISSPort = 0;  // 0 means KISS server disabled
@@ -71,11 +68,101 @@ bool StartFEC(UCHAR * bytData, int Len, char * strDataMode, int intRepeats, bool
 
 static SOCKET KISSListenSock = INVALID_SOCKET;
 static SOCKET KISSClients[KISS_MAX_CLIENTS];
+static KISSDecoder KISSDecoders[KISS_MAX_CLIENTS];
 
-// Per-client KISS decoder state
-static UCHAR KISSRxFrame[KISS_MAX_CLIENTS][KISS_BUFSIZE];
-static int KISSRxLen[KISS_MAX_CLIENTS];
-static bool KISSInEsc[KISS_MAX_CLIENTS];
+// Return the single-frame payload capacity (bytes) of the named FEC mode, or 0
+// if the mode is unknown.
+int KISSModeCapacity(const char *fecmode)
+{
+	char FullType[20];
+	snprintf(FullType, sizeof(FullType), "%s.E", fecmode);
+	int fc = FrameCode(FullType);
+	if (fc <= 0)
+		return 0;
+	return FrameSize[fc];
+}
+
+// KISS encapsulate an AX.25 frame into out: FEND, type byte (0x00 = data,
+// port 0), escaped payload, FEND.  Returns the number of bytes written, or -1
+// if out is too small.
+int KISSEncode(const UCHAR *axdata, int len, UCHAR *out, int outsize)
+{
+	int o = 0;
+
+	if (outsize < 3)
+		return -1;  // need at least FEND, type, FEND
+
+	out[o++] = FEND;
+	out[o++] = 0x00;  // data frame, port 0
+	for (int i = 0; i < len; i++)
+	{
+		UCHAR b = axdata[i];
+		if (b == FEND || b == FESC)
+		{
+			// An escape pair plus the trailing FEND must still fit.
+			if (o + 3 > outsize)
+				return -1;
+			out[o++] = FESC;
+			out[o++] = (b == FEND) ? TFEND : TFESC;
+		}
+		else
+		{
+			if (o + 2 > outsize)
+				return -1;
+			out[o++] = b;
+		}
+	}
+	out[o++] = FEND;
+	return o;
+}
+
+void KISSDecoderReset(KISSDecoder *d)
+{
+	d->len = 0;
+	d->inEsc = false;
+	d->overflow = false;
+}
+
+// Feed one received byte to the decoder.  Returns the length of a completed
+// frame (with its de-escaped bytes in d->frame) when a frame terminates, or 0
+// otherwise.
+int KISSDecoderByte(KISSDecoder *d, UCHAR b)
+{
+	if (b == FEND)
+	{
+		// A frame terminates.  Report its length unless it was empty (a mere
+		// delimiter) or overflowed.  Either way, start fresh afterwards.
+		int ready = (!d->overflow && d->len > 0) ? d->len : 0;
+		d->len = 0;
+		d->inEsc = false;
+		d->overflow = false;
+		return ready;
+	}
+
+	if (d->inEsc)
+	{
+		d->inEsc = false;
+		if (b == TFEND)
+			b = FEND;
+		else if (b == TFESC)
+			b = FESC;
+		// else protocol violation; store the byte as-is
+	}
+	else if (b == FESC)
+	{
+		d->inEsc = true;
+		return 0;
+	}
+
+	if (!d->overflow)
+	{
+		if (d->len < KISS_FRAME_MAX)
+			d->frame[d->len++] = b;
+		else
+			d->overflow = true;  // discard until the next FEND
+	}
+	return 0;
+}
 
 // Parse the --kiss argument, which is "[addr:]port".  If addr is omitted, the
 // server listens on loopback only.  Returns true on success.
@@ -117,8 +204,7 @@ bool KISSInit()
 	for (int i = 0; i < KISS_MAX_CLIENTS; i++)
 	{
 		KISSClients[i] = INVALID_SOCKET;
-		KISSRxLen[i] = 0;
-		KISSInEsc[i] = false;
+		KISSDecoderReset(&KISSDecoders[i]);
 	}
 
 	if (KISSPort == 0)
@@ -128,16 +214,14 @@ bool KISSInit()
 	// configured FEC mode cannot carry at least 256 bytes in a single frame,
 	// AX.25 packets would be fragmented across multiple FEC frames, which the
 	// receiver cannot reassemble.  Treat this as a hard failure.
-	char FullType[20];
-	snprintf(FullType, sizeof(FullType), "%s.E", strFECMode);
-	int fc = FrameCode(FullType);
-	if (fc <= 0 || FrameSize[fc] < 256)
+	int cap = KISSModeCapacity(strFECMode);
+	if (cap < 256)
 	{
 		ZF_LOGE("KISS: FEC mode %s carries only %d bytes per frame, but at"
 			" least 256 are required for KISS operation.  KISS server not"
 			" started.  Set a larger FECMODE (e.g. 16QAM.500.100 = 256 bytes,"
 			" 4FSK.2000.600 = 600 bytes, or 16QAM.2000.100 = 1024 bytes).",
-			strFECMode, fc > 0 ? FrameSize[fc] : 0);
+			strFECMode, cap);
 		KISSPort = 0;
 		return false;
 	}
@@ -201,7 +285,7 @@ bool KISSInit()
 
 	ZF_LOGI("KISS: listening for TCP KISS connections on %s:%d (FEC mode %s,"
 		" %d bytes/frame)",
-		KISSAddr[0] ? KISSAddr : "127.0.0.1", KISSPort, strFECMode, FrameSize[fc]);
+		KISSAddr[0] ? KISSAddr : "127.0.0.1", KISSPort, strFECMode, cap);
 
 	return true;
 }
@@ -215,14 +299,12 @@ static void KISSTransmit(UCHAR *axdata, int len)
 	// Guard against a runtime FECMODE change to a frame too small to hold this
 	// packet in a single FEC frame.  Dropping it is preferable to transmitting
 	// a fragmented frame the receiver cannot reassemble.
-	char FullType[20];
-	snprintf(FullType, sizeof(FullType), "%s.E", strFECMode);
-	int fc = FrameCode(FullType);
-	if (fc <= 0 || FrameSize[fc] < len)
+	int cap = KISSModeCapacity(strFECMode);
+	if (cap < len)
 	{
 		ZF_LOGE("KISS: dropping %d byte AX.25 frame; current FEC mode %s holds"
 			" only %d bytes per frame and the frame would be fragmented.",
-			len, strFECMode, fc > 0 ? FrameSize[fc] : 0);
+			len, strFECMode, cap);
 		return;
 	}
 
@@ -255,46 +337,15 @@ static void KISSProcessFrame(UCHAR *frame, int len)
 	}
 }
 
-// Feed received bytes from a client through the KISS decoder.
+// Feed received bytes from a client through its KISS decoder, transmitting any
+// completed frames.
 static void KISSDecode(int idx, UCHAR *data, int len)
 {
 	for (int i = 0; i < len; i++)
 	{
-		UCHAR b = data[i];
-
-		if (b == FEND)
-		{
-			if (KISSRxLen[idx] > 0)
-				KISSProcessFrame(KISSRxFrame[idx], KISSRxLen[idx]);
-			KISSRxLen[idx] = 0;
-			KISSInEsc[idx] = false;
-			continue;
-		}
-
-		if (KISSInEsc[idx])
-		{
-			KISSInEsc[idx] = false;
-			if (b == TFEND)
-				b = FEND;
-			else if (b == TFESC)
-				b = FESC;
-			// else protocol violation; store the byte as-is and continue
-		}
-		else if (b == FESC)
-		{
-			KISSInEsc[idx] = true;
-			continue;
-		}
-
-		if (KISSRxLen[idx] < KISS_BUFSIZE)
-			KISSRxFrame[idx][KISSRxLen[idx]++] = b;
-		else
-		{
-			// Frame too long; discard it and resynchronise on the next FEND.
-			ZF_LOGW("KISS: oversize frame from client, discarding.");
-			KISSRxLen[idx] = 0;
-			KISSInEsc[idx] = false;
-		}
+		int flen = KISSDecoderByte(&KISSDecoders[idx], data[i]);
+		if (flen > 0)
+			KISSProcessFrame(KISSDecoders[idx].frame, flen);
 	}
 }
 
@@ -305,15 +356,14 @@ static void KISSCloseClient(int idx)
 		closesocket(KISSClients[idx]);
 		KISSClients[idx] = INVALID_SOCKET;
 	}
-	KISSRxLen[idx] = 0;
-	KISSInEsc[idx] = false;
+	KISSDecoderReset(&KISSDecoders[idx]);
 }
 
 // Accept new connections and read data from connected clients.  Non-blocking.
 void KISSPoll()
 {
 	u_long param = 1;
-	UCHAR buf[KISS_BUFSIZE];
+	UCHAR buf[KISS_FRAME_MAX];
 
 	if (KISSListenSock == INVALID_SOCKET)
 		return;
@@ -346,8 +396,7 @@ void KISSPoll()
 
 		ioctl(newsock, FIONBIO, &param);
 		KISSClients[slot] = newsock;
-		KISSRxLen[slot] = 0;
-		KISSInEsc[slot] = false;
+		KISSDecoderReset(&KISSDecoders[slot]);
 		ZF_LOGI("KISS: client connected from %s:%d (slot %d)",
 			inet_ntoa(sin.sin_addr), ntohs(sin.sin_port), slot);
 	}
@@ -391,30 +440,16 @@ void KISSSendToClients(UCHAR *axdata, int len)
 	if (KISSListenSock == INVALID_SOCKET || len <= 0)
 		return;
 
-	// Build the KISS frame: FEND, type byte (0x00 = data, port 0), escaped
-	// payload, FEND.  Worst case each payload byte expands to two bytes.
-	UCHAR out[2 * KISS_BUFSIZE + 3];
-	int o = 0;
-
-	out[o++] = FEND;
-	out[o++] = 0x00;  // data frame, port 0
-	for (int i = 0; i < len && o < (int)sizeof(out) - 2; i++)
+	// Build the KISS frame.  Worst case each payload byte expands to two bytes,
+	// plus the leading FEND, type byte, and trailing FEND.
+	UCHAR out[2 * KISS_FRAME_MAX + 3];
+	int o = KISSEncode(axdata, len, out, sizeof(out));
+	if (o < 0)
 	{
-		UCHAR b = axdata[i];
-		if (b == FEND)
-		{
-			out[o++] = FESC;
-			out[o++] = TFEND;
-		}
-		else if (b == FESC)
-		{
-			out[o++] = FESC;
-			out[o++] = TFESC;
-		}
-		else
-			out[o++] = b;
+		ZF_LOGW("KISS: received frame too large to encode (%d bytes), dropping.",
+			len);
+		return;
 	}
-	out[o++] = FEND;
 
 	for (int i = 0; i < KISS_MAX_CLIENTS; i++)
 	{
