@@ -54,6 +54,7 @@ OBJS = \
 	$(BUILDDIR)/src/common/FEC.o \
 	$(BUILDDIR)/src/common/FFT.o \
 	$(BUILDDIR)/src/common/HostInterface.o \
+	$(BUILDDIR)/src/common/KISS.o \
 	$(BUILDDIR)/src/common/Locator.o \
 	$(BUILDDIR)/src/common/log_file.o \
 	$(BUILDDIR)/src/common/log.o \

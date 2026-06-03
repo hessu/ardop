@@ -184,6 +184,14 @@ void InitializeConnection();
 void AddTagToDataAndSendToHost(UCHAR * Msg, char * Type, int Len);
 void TCPAddTagToDataAndSendToHost(UCHAR * Msg, char * Type, int Len);
 
+// TCP KISS server (KISS.c)
+extern int KISSPort;  // 0 means KISS server disabled
+extern char KISSAddr[64];
+bool KISSConfig(const char *arg);
+bool KISSInit();
+void KISSPoll();
+void KISSSendToClients(UCHAR *axdata, int len);
+
 void RemoveDataFromQueue(int Len);
 
 void GetSemaphore();
