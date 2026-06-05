@@ -37,6 +37,7 @@ const char ProductName[] = "ardopcf";
 #include "wav.h"
 #include "Modulate.h"
 #include "Webgui.h"
+#include "RawInput.h"
 #include "rockliff/rrs.h"
 
 UCHAR bytDataToSend[DATABUFFERSIZE];
@@ -678,8 +679,12 @@ void ardopmain() {
 	}
 
 	while(!blnClosing) {
-		if (RXEnabled)
-			PollReceivedSamples();
+		if (RXEnabled) {
+			if (RawInputActive())
+				RawInputPoll();
+			else
+				PollReceivedSamples();
+		}
 		WebguiPoll();
 		KISSPoll();
 		if (ProtocolMode != RXO) {

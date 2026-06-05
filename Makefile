@@ -60,6 +60,7 @@ OBJS = \
 	$(BUILDDIR)/src/common/log.o \
 	$(BUILDDIR)/src/common/Modulate.o \
 	$(BUILDDIR)/src/common/Packed6.o \
+	$(BUILDDIR)/src/common/RawInput.o \
 	$(BUILDDIR)/src/common/RXO.o \
 	$(BUILDDIR)/src/common/sdft.o \
 	$(BUILDDIR)/src/common/SoundInput.o \

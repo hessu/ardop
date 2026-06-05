@@ -38,6 +38,7 @@ void PollReceivedSamples();
 
 #include "ardopcommon.h"
 #include "wav.h"
+#include "RawInput.h"
 
 void ProcessCommandFromHost(char * strCMD);
 
@@ -384,6 +385,9 @@ static struct option long_options[] =
 	{"decodewav",  required_argument, 0, 'd'},
 	{"sdft", no_argument, 0, 's'},
 	{"kiss",  required_argument, 0 , 'K'},
+	{"rxaudio",  required_argument, 0 , 0x100},
+	{"rxrate",  required_argument, 0 , 0x101},
+	{"rxoffset",  required_argument, 0 , 0x102},
 	{"help",  no_argument, 0 , 'h'},
 	{ NULL , no_argument , NULL , no_argument }
 };
@@ -448,6 +452,12 @@ char HelpScreen[] =
 	"-T or --writetxwav                   Write WAV files of sent audio for debugging.\n"
 	"-d pathname or --decodewav pathname  Pathname of WAV file to decode instead of listening.\n"
 	"                                       Repeat up to 5 times for multiple WAV files.\n"
+	"--rxaudio pathname                   Read raw s16le RX audio from pathname instead of a\n"
+	"                                     capture device ('-' for stdin; may be a FIFO/socket).\n"
+	"--rxrate Hz                          Sample rate of --rxaudio input (default 48000; must be\n"
+	"                                     a multiple of 12000).\n"
+	"--rxoffset Hz                        Audio frequency in the --rxaudio stream to tune to the\n"
+	"                                     modem's 1500 Hz center (default 1500).\n"
 	"-s or --sdft                         Use the alternative Sliding DFT based 4FSK decoder.\n"
 	"-K [addr:]port or --kiss [addr:]port Run a TCP KISS server on the given port for sending\n"
 	"                                       and receiving AX.25 frames (e.g. APRS) using ARDOP\n"
@@ -498,6 +508,12 @@ int processargs(int argc, char * argv[]) {
 	// including those that set the use of left/right channels.
 	char tmpCaptureDevice[DEVSTRSZ] = "";
 	char tmpPlaybackDevice[DEVSTRSZ] = "";
+
+	// Raw RX audio input (--rxaudio / --rxrate / --rxoffset).  Parsed here and
+	// configured after the loop so all three values are available together.
+	char tmpRawPath[256] = "";
+	int tmpRawRate = 48000;
+	double tmpRawOffset = 1500.0;
 
 	cmdstr[0] = 0x00;  // reset to a zero length str
 	for (int i = 0; i < argc; ++i) {
@@ -820,6 +836,21 @@ int processargs(int argc, char * argv[]) {
 						optarg);
 				break;
 
+			case 0x100:  // --rxaudio
+				if (strlen(optarg) >= sizeof(tmpRawPath))
+					ZF_LOGE("ERROR: --rxaudio path too long.  Ignoring.");
+				else
+					strcpy(tmpRawPath, optarg);  // length checked
+				break;
+
+			case 0x101:  // --rxrate
+				tmpRawRate = atoi(optarg);
+				break;
+
+			case 0x102:  // --rxoffset
+				tmpRawOffset = atof(optarg);
+				break;
+
 			case ':':
 				ZF_LOGE("ERROR: Missing argument for -%c.  Ignoring this option"
 					, optopt);
@@ -897,9 +928,23 @@ int processargs(int argc, char * argv[]) {
 		wg_port = host_port - 1;
 	}
 
+	// Raw RX audio input replaces the sound-card capture device: the samples are
+	// read from a stream/file and downconverted in software, so open NOSOUND for
+	// the backend capture device.  Transmit still uses the playback device.
+	if (tmpRawPath[0] != 0x00) {
+		if (!RawInputConfig(tmpRawPath, tmpRawRate, tmpRawOffset)) {
+			ZF_LOGE("ERROR: invalid --rxaudio configuration.  Raw input disabled.");
+		} else {
+			if (tmpCaptureDevice[0] != 0x00 && strcmp(tmpCaptureDevice, "NOSOUND") != 0)
+				ZF_LOGW("--rxaudio overrides the configured capture device \"%s\".",
+					tmpCaptureDevice);
+			snprintf(tmpCaptureDevice, sizeof(tmpCaptureDevice), "NOSOUND");
+		}
+	}
+
 	if (strcmp(tmpCaptureDevice, "-1") == 0)
 		snprintf(tmpCaptureDevice, sizeof(tmpCaptureDevice), "NOSOUND");
-	if (strcmp(tmpCaptureDevice, "NOSOUND") == 0)
+	if (strcmp(tmpCaptureDevice, "NOSOUND") == 0 && !RawInputActive())
 		ZF_LOGI("Using NOSOUND for audio input.  This is only"
 		" useful for testing/diagnostic purposes.");
 
@@ -922,6 +967,9 @@ int processargs(int argc, char * argv[]) {
 				tmpPlaybackDevice);
 		}
 	}
+
+	if (RawInputActive() && !RawInputOpen())
+		ZF_LOGE("ERROR: --rxaudio source could not be opened.");
 
 	if (DecodeWav[0][0] != 0x00)
 		return 0;  // --decodewav, so no need to log about audio/ptt devices
