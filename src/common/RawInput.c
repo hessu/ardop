@@ -173,6 +173,9 @@ bool RawInputOpen()
 	BuildTaps();
 
 	RXEnabled = true;  // the main loop must poll us even with no sound card open
+	Capturing = true;  // raw input is receive-only; the NOSOUND capture backend
+	                   // never calls StartCapture(), so set this here or EmitSample()
+	                   // would feed PreprocessNewSamples() (no demod/level/waterfall).
 
 	ZF_LOGI("RawInput: reading s16le from %s at %d Hz, translating %.1f Hz ->"
 		" %.0f Hz, decimating by %d to %d Hz (%d FIR taps).",
